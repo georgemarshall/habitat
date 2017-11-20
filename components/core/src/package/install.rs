@@ -26,7 +26,7 @@ use toml;
 use toml::Value;
 
 use super::{Identifiable, PackageIdent, Target, PackageTarget};
-use super::metadata::{Bind, BindMapping, MetaFile, PackageType, parse_key_value};
+use super::metadata::{Bind, BindMapping, MetaFile, PackageType, PkgEnv, parse_key_value};
 use error::{Error, Result};
 use fs;
 
@@ -318,6 +318,21 @@ impl PackageInstall {
         }
     }
 
+    /// Returns a Rust representation of the mappings defined by the `pkg_env` plan variable.
+    ///
+    /// # Failures
+    ///
+    /// * The package contains a Environment metafile but it could not be read or it was malformed.
+    pub fn environment(&self) -> Result<PkgEnv> {
+        match self.read_metafile(MetaFile::Environment) {
+            Ok(body) => PkgEnv::from_str(&body),
+            Err(Error::MetaFileNotFound(MetaFile::Environment)) => {
+                self.path().and_then(PkgEnv::from_paths)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn deps(&self) -> Result<Vec<PackageIdent>> {
         self.read_deps(MetaFile::Deps)
     }
@@ -364,167 +379,80 @@ impl PackageInstall {
         &self.ident
     }
 
-    /// Returns the contents of a package's runtime PATH environment
-    /// variable (if set), split into individual entries.
+    /// Return the PATH string from the package metadata, if it exists
     ///
-    /// Preferentially looks in the `RUNTIME_ENVIRONMENT` metadata file
-    /// to find a `PATH` variable. If this metadata file is not
-    /// present, we're dealing with an older Habitat package, and will
-    /// instead look in the `PATH` metadata file.
+    /// # Failures
+    ///
+    /// * The package contains a Path metafile but it could not be read or it was malformed
+    fn path(&self) -> Result<Vec<PathBuf>> {
+        match self.read_metafile(MetaFile::Path) {
+            Ok(body) => Ok(env::split_paths(&body).collect()),
+            Err(Error::MetaFileNotFound(MetaFile::Path)) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Returns the contents of a package's PATH environment variable (if set), split into
+    /// individual entries.
+    ///
+    /// Preferentially looks in the `ENVIRONMENT` metadata file to find a `PATH` variable. If this
+    /// metadata file is not present, we're dealing with an older Habitat package, and will instead
+    /// look in the `PATH` metadata file.
     ///
     /// If no value for `PATH` can be found, return an empty `Vec`.
     pub fn paths(&self) -> Result<Vec<PathBuf>> {
-        match self.existing_metafile(MetaFile::RuntimeEnvironment) {
-            Some(_) => {
-                // A RUNTIME_ENVIRONMENT file exists!
-                let env = self.runtime_environment()?;
-                match env.get("PATH") {
-                    Some(path) => {
-                        let v = env::split_paths(&path).map(|p| PathBuf::from(&p)).collect();
-                        Ok(v)
-                    }
-                    None => Ok(vec![]),
-                }
-            }
-            None => {
-                // No RUNTIME_ENVIRONMENT file exists; fall back to PATH
-                self.legacy_path()
-            }
+        match self.environment()?.get("PATH") {
+            Some(path) => Ok(env::split_paths(&path).collect()),
+            None => Ok(Vec::new()),
         }
     }
 
-    /// Attempts to load the extracted package for each direct dependency and returns a
-    /// `Package` struct representation of each in the returned vector.
+    /// Return the embedded runtime environment specification for a package.
     ///
     /// # Failures
     ///
-    /// * Any direct dependency could not be located or it's contents could not be read
-    ///   from disk
-    fn load_deps(&self) -> Result<Vec<PackageInstall>> {
-        let ddeps = self.deps()?;
-        let mut deps = Vec::with_capacity(ddeps.len());
-        for dep in ddeps.iter() {
-            let dep_install = Self::load(dep, Some(&*self.fs_root_path))?;
-            deps.push(dep_install);
-        }
-        Ok(deps)
-    }
-
-    /// Attempts to load the extracted package for each transitive dependency and returns a
-    /// `Package` struct representation of each in the returned vector.
-    ///
-    /// # Failures
-    ///
-    /// * Any transitive dependency could not be located or it's contents could not be read
-    ///   from disk
-    fn load_tdeps(&self) -> Result<Vec<PackageInstall>> {
-        let tdeps = self.tdeps()?;
-        let mut deps = Vec::with_capacity(tdeps.len());
-        for dep in tdeps.iter() {
-            let dep_install = Self::load(dep, Some(&*self.fs_root_path))?;
-            deps.push(dep_install);
-        }
-        Ok(deps)
-    }
-
-    // Extract the contents of the PATH metadata file, if present.
-    fn legacy_path(&self) -> Result<Vec<PathBuf>> {
-        match self.read_metafile(MetaFile::Path) {
-            Ok(body) => {
-                let v = env::split_paths(&body).collect();
-                Ok(v)
-            }
-            Err(Error::MetaFileNotFound(MetaFile::Path)) => Ok(vec![]),
-            Err(e) => Err(e),
-        }
-    }
-
-    // Determine the complete path for this package, taking into
-    // account all its dependencies. Normally we would take this from
-    // `RUNTIME_ENVIRONMENT`, but for packages that were made before
-    // that was introduced, this is how we compute it.
-    fn full_legacy_path(&self) -> Result<Vec<PathBuf>> {
-        let mut full_path = Vec::new(); // TODO (CM): determine capacity first
-        let mut seen = HashSet::new();
-
-        // Take care of our own path entries first
-        for path in self.legacy_path()? {
-            if !seen.contains(&path) {
-                seen.insert(path.clone());
-                full_path.push(path);
-            }
-        }
-        // Given a list of transitive dependencies:
-        //
-        // [ A, B, C, D ]
-        //
-        // and a list of direct dependencies:
-        //
-        // [ B, D ]
-        //
-        // we construct a final dependency list of:
-        //
-        // [ A, B, C, D, B, D]
-        //
-        // We then reverse this to mirror the priority that a system
-        // path would use:
-        //
-        // [ D, B, D, C, B, A ]
-        //
-        // That is, since D comes after B in the dependency list, it's
-        // path should supersede that of B, and likewise for any
-        // transitive dependencies.
-        //
-        // By processing the list this way, we extend the final system
-        // path by placing an entry at the *end* of the path only if
-        // we have not encountered it before.
-        let all_deps = self.load_tdeps()?
-            .into_iter()
-            .chain(self.load_deps()?.into_iter())
-            .rev();
-
-        for dep in all_deps {
-            for p in dep.legacy_path()? {
-                if !seen.contains(&p) {
-                    seen.insert(p.clone());
-                    full_path.push(p);
-                }
-            }
-        }
-        Ok(full_path)
-    }
-
-    /// Return the embedded runtime environment specification for a
-    /// package.
-    pub fn runtime_environment(&self) -> Result<HashMap<String, String>> {
+    /// * The package contains a RuntimeEnvironment metafile but it could not be read or it was
+    /// malformed.
+    pub fn runtime_environment(&self) -> Result<PkgEnv> {
         match self.read_metafile(MetaFile::RuntimeEnvironment) {
-            Ok(body) => {
-                let mut env = HashMap::new();
-                for line in body.lines() {
-                    let parts: Vec<&str> = line.splitn(2, "=").collect();
-                    if parts.len() != 2 {
-                        return Err(Error::MetaFileMalformed(MetaFile::RuntimeEnvironment));
-                    }
-                    let key = parts[0].to_string();
-                    let value = parts[1].to_string();
-                    env.insert(key, value);
-                }
-                Ok(env)
-            }
+            Ok(body) => PkgEnv::from_str(&body),
             Err(Error::MetaFileNotFound(MetaFile::RuntimeEnvironment)) => {
-                // If there was no RUNTIME_ENVIRONMENT, we can at
-                // least return a proper PATH
-                let path = env::join_paths(self.full_legacy_path()?.iter())?
-                    .into_string()
-                    .map_err(|os_string| Error::InvalidPathString(os_string))?;
-
-                let mut env = HashMap::new();
-                env.insert(String::from("PATH"), path);
-                Ok(env)
-
+                self.runtime_path().and_then(PkgEnv::from_paths)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Returns a `Vec<PathBuf>` with the full run path for this package. The `PATH` string will be
+    /// constructed by adding all `PATH` metadata entries from the *direct* dependencies first (in
+    /// declared order) and then from any remaining transitive dependencies last (in lexically
+    /// sorted order).
+    fn runtime_path(&self) -> Result<Vec<PathBuf>> {
+        let mut idents = HashSet::new();
+        let mut run_paths: Vec<PathBuf> = Vec::new();
+
+        let mut p = self.paths()?;
+        run_paths.append(&mut p);
+        idents.insert(self.ident().clone());
+
+        let deps: Vec<PackageInstall> = self.load_deps()?;
+        for dep in deps.iter() {
+            let mut p = dep.paths()?;
+            run_paths.append(&mut p);
+            idents.insert(dep.ident().clone());
+        }
+
+        let tdeps: Vec<PackageInstall> = self.load_tdeps()?;
+        for dep in tdeps.iter() {
+            if idents.contains(dep.ident()) {
+                continue;
+            }
+            let mut p = dep.paths()?;
+            run_paths.append(&mut p);
+            idents.insert(dep.ident().clone());
+        }
+
+        Ok(run_paths)
     }
 
     pub fn installed_path(&self) -> &Path {
@@ -633,6 +561,40 @@ impl PackageInstall {
             Err(Error::MetaFileNotFound(_)) => Ok(deps),
             Err(e) => Err(e),
         }
+    }
+
+    /// Attempts to load the extracted package for each direct dependency and returns a
+    /// `Package` struct representation of each in the returned vector.
+    ///
+    /// # Failures
+    ///
+    /// * Any direct dependency could not be located or it's contents could not be read
+    ///   from disk
+    fn load_deps(&self) -> Result<Vec<PackageInstall>> {
+        let ddeps = self.deps()?;
+        let mut deps = Vec::with_capacity(ddeps.len());
+        for dep in ddeps.iter() {
+            let dep_install = Self::load(dep, Some(&*self.fs_root_path))?;
+            deps.push(dep_install);
+        }
+        Ok(deps)
+    }
+
+    /// Attempts to load the extracted package for each transitive dependency and returns a
+    /// `Package` struct representation of each in the returned vector.
+    ///
+    /// # Failures
+    ///
+    /// * Any transitive dependency could not be located or it's contents could not be read
+    ///   from disk
+    fn load_tdeps(&self) -> Result<Vec<PackageInstall>> {
+        let tdeps = self.tdeps()?;
+        let mut deps = Vec::with_capacity(tdeps.len());
+        for dep in tdeps.iter() {
+            let dep_install = Self::load(dep, Some(&*self.fs_root_path))?;
+            deps.push(dep_install);
+        }
+        Ok(deps)
     }
 
     /// Returns a list of package structs built from the contents of the given directory.

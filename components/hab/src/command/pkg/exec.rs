@@ -29,18 +29,21 @@ where
     T: Into<PathBuf>,
 {
     let command = command.into();
-    let pkg_install = PackageInstall::load(&ident, Some(&*FS_ROOT_PATH))?;
+    let pkg_install = PackageInstall::load(ident, Some(&*FS_ROOT_PATH))?;
     let mut run_env: HashMap<_, _> = HashMap::from_iter(pkg_install.runtime_environment()?);
 
-    let mut paths: Vec<PathBuf> = match run_env.get("PATH") {
-        Some(path) => env::split_paths(&path).collect(),
+    let paths: Vec<PathBuf> = match run_env.get("PATH") {
+        Some(path) => {
+            env::split_paths(&path)
+                .map(|p| if p.starts_with("/") {
+                    Path::new(&*FS_ROOT_PATH).join(p.strip_prefix("/").unwrap())
+                } else {
+                    p
+                })
+                .collect()
+        }
         None => vec![],
     };
-    for i in 0..paths.len() {
-        if paths[i].starts_with("/") {
-            paths[i] = Path::new(&*FS_ROOT_PATH).join(paths[i].strip_prefix("/").unwrap());
-        }
-    }
     let joined = env::join_paths(paths)?;
     run_env.insert(
         String::from("PATH"),
@@ -49,7 +52,7 @@ where
         ),
     );
 
-    for (key, value) in run_env.into_iter() {
+    for (key, value) in run_env {
         debug!("Setting: {}='{}'", key, value);
         env::set_var(key, value);
     }

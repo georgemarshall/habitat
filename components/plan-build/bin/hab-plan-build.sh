@@ -1090,7 +1090,7 @@ _validate_deps() {
     warn 'and has a direct dependency on another package which itself depends'
     warn 'on another version of the same package (`acme/A/2.0/20151201060001`).'
     warn 'If this package (`acme/A`) contains shared libraries which are'
-    warn 'loaded at runtime by the current Plan, then both versions of'
+    warn 'loaded at runtime by the current Plan, then both versions ofk'
     warn '`acme/A` could be loaded into the same process in a potentially'
     warn 'surprising order. Worse, if both versions of `acme/A` are'
     warn 'ABI-incompatible, runtime segmentation faults are more than likely.'

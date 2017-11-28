@@ -30,7 +30,7 @@ use super::metadata::{Bind, BindMapping, MetaFile, PackageType, PkgEnv, parse_ke
 use error::{Error, Result};
 use fs;
 
-pub const DEFAULT_CFG_FILE: &'static str = "default.toml";
+pub const DEFAULT_CFG_FILE: &str = "default.toml";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PackageInstall {
@@ -98,9 +98,9 @@ impl PackageInstall {
         }
         let pl = Self::package_list(&package_root_path)?;
         if ident.fully_qualified() {
-            if pl.iter().any(|ref p| p.satisfies(ident)) {
+            if pl.iter().any(|p| p.satisfies(ident)) {
                 Ok(PackageInstall {
-                    installed_path: fs::pkg_install_path(&ident, Some(&fs_root_path)),
+                    installed_path: fs::pkg_install_path(ident, Some(&fs_root_path)),
                     fs_root_path: fs_root_path,
                     package_root_path: package_root_path,
                     ident: ident.clone(),
@@ -115,7 +115,7 @@ impl PackageInstall {
                  b| {
                     match winner {
                         Some(a) => {
-                            match a.partial_cmp(&b) {
+                            match a.partial_cmp(b) {
                                 Some(Ordering::Greater) => Some(a),
                                 Some(Ordering::Equal) => Some(a),
                                 Some(Ordering::Less) => Some(b.clone()),
@@ -129,7 +129,7 @@ impl PackageInstall {
             if let Some(id) = latest {
                 Ok(PackageInstall {
                     installed_path: fs::pkg_install_path(&id, Some(&fs_root_path)),
-                    fs_root_path: PathBuf::from(fs_root_path),
+                    fs_root_path: fs_root_path,
                     package_root_path: package_root_path,
                     ident: id.clone(),
                 })
@@ -167,10 +167,10 @@ impl PackageInstall {
 
         let pl = Self::package_list(&package_root_path)?;
         let latest: Option<PackageIdent> = pl.iter()
-            .filter(|ref p| p.origin == ident.origin && p.name == ident.name)
+            .filter(|p| p.origin == ident.origin && p.name == ident.name)
             .fold(None, |winner, b| match winner {
                 Some(a) => {
-                    match a.cmp(&b) {
+                    match a.cmp(b) {
                         Ordering::Greater | Ordering::Equal => Some(a),
                         Ordering::Less => Some(b.clone()),
                     }
@@ -213,13 +213,8 @@ impl PackageInstall {
     pub fn is_runnable(&self) -> bool {
         // Currently, a runnable package can be determined by checking if a `run` hook exists in
         // package's hooks directory or directly in the package prefix.
-        if self.installed_path.join("hooks").join("run").is_file() ||
+        self.installed_path.join("hooks").join("run").is_file() ||
             self.installed_path.join("run").is_file()
-        {
-            true
-        } else {
-            false
-        }
     }
 
     /// Determine what kind of package this is.
@@ -279,13 +274,13 @@ impl PackageInstall {
             Ok(body) => {
                 let mut bind_map = HashMap::new();
                 for line in body.lines() {
-                    let mut parts = line.split("=");
+                    let mut parts = line.split('=');
                     let package = match parts.next() {
                         Some(ident) => ident.parse()?,
                         None => return Err(Error::MetaFileBadBind),
                     };
                     let binds: Result<Vec<BindMapping>> = match parts.next() {
-                        Some(binds) => binds.split(" ").map(|b| b.parse()).collect(),
+                        Some(binds) => binds.split(' ').map(|b| b.parse()).collect(),
                         None => Err(Error::MetaFileBadBind),
                     };
                     bind_map.insert(package, binds?);
@@ -436,14 +431,14 @@ impl PackageInstall {
         idents.insert(self.ident().clone());
 
         let deps: Vec<PackageInstall> = self.load_deps()?;
-        for dep in deps.iter() {
+        for dep in &deps {
             let mut p = dep.paths()?;
             run_paths.append(&mut p);
             idents.insert(dep.ident().clone());
         }
 
         let tdeps: Vec<PackageInstall> = self.load_tdeps()?;
-        for dep in tdeps.iter() {
+        for dep in &tdeps {
             if idents.contains(dep.ident()) {
                 continue;
             }
@@ -494,7 +489,7 @@ impl PackageInstall {
     /// * Contents of the metafile could not be read
     /// * Contents of the metafile are unreadable or malformed
     fn read_metafile(&self, file: MetaFile) -> Result<String> {
-        match self.existing_metafile(file.clone()) {
+        match self.existing_metafile(&file) {
             Some(filepath) => {
                 match File::open(&filepath) {
                     Ok(mut f) => {
@@ -515,7 +510,7 @@ impl PackageInstall {
     ///
     /// Useful for fallback logic for dealing with older Habitat
     /// packages.
-    fn existing_metafile(&self, file: MetaFile) -> Option<PathBuf> {
+    fn existing_metafile(&self, file: &MetaFile) -> Option<PathBuf> {
         let filepath = self.installed_path.join(file.to_string());
         match std::fs::metadata(&filepath) {
             Ok(_) => Some(filepath),
@@ -545,7 +540,7 @@ impl PackageInstall {
 
         match self.read_metafile(file) {
             Ok(body) => {
-                if body.len() > 0 {
+                if !body.is_empty() {
                     for id in body.lines() {
                         let package = PackageIdent::from_str(id)?;
                         if !package.fully_qualified() && must_be_fully_qualified {
@@ -571,13 +566,10 @@ impl PackageInstall {
     /// * Any direct dependency could not be located or it's contents could not be read
     ///   from disk
     fn load_deps(&self) -> Result<Vec<PackageInstall>> {
-        let ddeps = self.deps()?;
-        let mut deps = Vec::with_capacity(ddeps.len());
-        for dep in ddeps.iter() {
-            let dep_install = Self::load(dep, Some(&*self.fs_root_path))?;
-            deps.push(dep_install);
-        }
-        Ok(deps)
+        self.deps()?
+            .iter()
+            .map(|dep| Self::load(dep, Some(&*self.fs_root_path)))
+            .collect()
     }
 
     /// Attempts to load the extracted package for each transitive dependency and returns a
@@ -588,20 +580,17 @@ impl PackageInstall {
     /// * Any transitive dependency could not be located or it's contents could not be read
     ///   from disk
     fn load_tdeps(&self) -> Result<Vec<PackageInstall>> {
-        let tdeps = self.tdeps()?;
-        let mut deps = Vec::with_capacity(tdeps.len());
-        for dep in tdeps.iter() {
-            let dep_install = Self::load(dep, Some(&*self.fs_root_path))?;
-            deps.push(dep_install);
-        }
-        Ok(deps)
+        self.tdeps()?
+            .iter()
+            .map(|dep| Self::load(dep, Some(&*self.fs_root_path)))
+            .collect()
     }
 
     /// Returns a list of package structs built from the contents of the given directory.
     fn package_list(path: &Path) -> Result<Vec<PackageIdent>> {
         let mut package_list: Vec<PackageIdent> = vec![];
         if std::fs::metadata(path)?.is_dir() {
-            Self::walk_origins(&path, &mut package_list)?;
+            Self::walk_origins(path, &mut package_list)?;
         }
         Ok(package_list)
     }
@@ -639,7 +628,7 @@ impl PackageInstall {
     /// Helper function for walk_names. Walks the given name DirEntry for directories and recurses
     /// into them to find release directories.
     fn walk_versions(
-        origin: &String,
+        origin: &str,
         name: &DirEntry,
         packages: &mut Vec<PackageIdent>,
     ) -> Result<()> {
@@ -658,8 +647,8 @@ impl PackageInstall {
     /// concatenated onto the given packages vector with the origin, name, version, and release of
     /// each.
     fn walk_releases(
-        origin: &String,
-        name: &String,
+        origin: &str,
+        name: &str,
         version: &DirEntry,
         packages: &mut Vec<PackageIdent>,
     ) -> Result<()> {
@@ -674,8 +663,12 @@ impl PackageInstall {
                 .to_string_lossy()
                 .into_owned()
                 .to_string();
-            let ident =
-                PackageIdent::new(origin.clone(), name.clone(), Some(version), Some(release));
+            let ident = PackageIdent::new(
+                origin.to_string(),
+                name.to_string(),
+                Some(version),
+                Some(release),
+            );
             packages.push(ident)
         }
         Ok(())
